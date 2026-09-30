@@ -13,7 +13,11 @@ import random
 import unittest
 from itertools import combinations
 
-from app.alignment import best_pairing_at, solve
+from app.alignment import (
+    best_pairing_at,
+    best_pairing_constrained,
+    solve,
+)
 
 
 def all_order_preserving_matchings(n, m):
@@ -222,8 +226,222 @@ class SolverTests(unittest.TestCase):
                 [tuple(p) for p in best_pairs],
             )
 
-    def test_fuzz_larger_counts_within_6_24(self):
-        # Validated input-size regime (6..24 each); enumerating all matchings
+class GapConstraintTests(unittest.TestCase):
+    def test_gap_segments_counts_and_leading_trailing_free(self):
+        # Six coincident pairs at offset 0, with unmatched pulses before the
+        # first pair and after the last pair on both sides.  Those must not
+        # count as gaps; every between-pair segment skips zero pulses.
+        A = [-100, 10, 20, 30, 40, 50, 60, 2000]
+        B = [-110, 11, 21, 31, 41, 51, 61, 3000]
+        # Offset 0, tol 2: the six middle pulses pair; outer pulses are junk.
+        res = solve(A, B, 0, 0, 2, 6, True, 0, 0)
+        self.assertTrue(res.sufficient)
+        self.assertEqual(res.offset, 0)
+        self.assertEqual(res.pair_count, 6)
+        self.assertEqual(len(res.gap_segments), 5)
+        for g in res.gap_segments:
+            self.assertEqual((g.skipped_a, g.skipped_b), (0, 0))
+        self.assertEqual(
+            [(u.index, u.time) for u in res.unpaired_a],
+            [(1, -100), (8, 2000)],
+        )
+        self.assertEqual(
+            [(u.index, u.time) for u in res.unpaired_b],
+            [(1, -110), (8, 3000)],
+        )
+
+    def test_zero_limit_forbids_any_skip_between_pairs(self):
+        # B interleaves noise pulses: every pair adjacency skips one B pulse.
+        # With limits 0/0 the chain can contain at most one pair, although
+        # the unconstrained optimum pairs three.
+        A = [10, 20, 30, 40, 50, 60]
+        B = [10, 15, 20, 25, 30, 35]
+        res = solve(A, B, 0, 0, 0, 3, True, 0, 0)
+        self.assertFalse(res.sufficient)
+        self.assertEqual(res.pair_count, 1)
+        self.assertEqual(
+            [(g.after_pair, g.skipped_a, g.skipped_b)
+             for g in res.broken_segments],
+            [(1, 0, 1), (2, 0, 1)],
+        )
+        # Loosening B's limit to 1 restores all three pairs.
+        res2 = solve(A, B, 0, 0, 0, 3, True, 0, 1)
+        self.assertTrue(res2.sufficient)
+        self.assertEqual(res2.pair_count, 3)
+
+    def test_scattered_coincidences_break_chain(self):
+        # The QC scenario: coincidences (tolerance 0) are scattered among
+        # unmatched pulses; unconstrained matching finds 4 pairs, but between
+        # pairs 2 and 3 each side skips two pulses, breaching limit 1.
+        A = [10, 20, 30, 40, 50, 60]
+        B = [10, 20, 33, 43, 50, 60]
+        # pairs: (10,10),(20,20),(50,50),(60,60); middle skips 2/side.
+        res = solve(A, B, 0, 0, 0, 4, True, 1, 1)
+        self.assertFalse(res.sufficient)
+        self.assertEqual(res.pair_count, 2)  # either run has 2 pairs
+        self.assertEqual(len(res.broken_segments), 1)
+        br = res.broken_segments[0]
+        self.assertEqual(br.after_pair, 2)
+        self.assertEqual((br.skipped_a, br.skipped_b), (2, 2))
+        self.assertEqual(br.a_indices, (3, 4))
+        self.assertEqual(br.b_indices, (3, 4))
+
+    def test_asymmetric_limits_per_side(self):
+        # Between the first pair and the rest, A skips 1 pulse (20) while B
+        # skips 2 (20, 21).  The B-side limit decides whether they join.
+        A = [10, 99, 200, 300, 310, 320]
+        B = [10, 50, 60, 200, 300, 310]
+        res = solve(A, B, 0, 0, 0, 4, True, 1, 1)
+        self.assertFalse(res.sufficient)
+        self.assertEqual(res.pair_count, 3)
+        self.assertEqual(
+            [(g.after_pair, g.skipped_a, g.skipped_b)
+             for g in res.broken_segments],
+            [(1, 1, 2)],
+        )
+        res2 = solve(A, B, 0, 0, 0, 4, True, 1, 2)
+        self.assertTrue(res2.sufficient)
+        self.assertEqual(res2.pair_count, 4)
+        self.assertEqual(
+            (res2.gap_segments[0].skipped_a,
+             res2.gap_segments[0].skipped_b),
+            (1, 2),
+        )
+
+    def test_constrained_fixed_offset_dp_basic(self):
+        A = [0, 10, 20, 30]
+        B = [0, 10, 20, 30]
+        obj, pairs = best_pairing_constrained(A, B, 0, 0, 0, 0)
+        self.assertEqual(len(pairs), 4)
+        self.assertEqual(pairs, [(0, 0), (1, 1), (2, 2), (3, 3)])
+        obj, pairs = best_pairing_constrained(A, B, 0, 0, 0, 0)
+        self.assertEqual(obj[0], 4)
+
+    def test_disabled_constraint_matches_plain_solver(self):
+        # Default call must be byte-for-byte the old behaviour.
+        A = [100, 240, 388, 512, 665, 820]
+        B = [18, 159, 306, 431, 585, 740]
+        res = solve(A, B, -1000, 1000, 25, 4)
+        self.assertFalse(res.gap_limit_enabled)
+        self.assertIsNone(res.max_gap_a)
+        self.assertEqual(res.gap_segments, ())
+        self.assertEqual(res.broken_segments, ())
+        d = res.to_dict()
+        self.assertNotIn("broken_segments", d)
+        self.assertEqual(d["gap_limit_enabled"], False)
+        self.assertIsNone(d["max_gap_a"])
+        self.assertEqual(d["gap_segments"], [])
+
+    def test_sufficient_constrained_result_has_segments_in_response(self):
+        A = [10, 20, 30, 40, 50, 60]
+        B = [10, 20, 30, 40, 50, 60]
+        res = solve(A, B, 0, 0, 0, 6, True, 0, 0)
+        d = res.to_dict()
+        self.assertTrue(d["sufficient"])
+        self.assertEqual(d["offset"], 0)
+        self.assertTrue(d["gap_limit_enabled"])
+        self.assertEqual((d["max_gap_a"], d["max_gap_b"]), (0, 0))
+        self.assertEqual(len(d["gap_segments"]), 5)
+        self.assertNotIn("diagnostic", d)
+
+    def test_chain_fuzz_against_brute_force(self):
+        rng = random.Random(424242)
+
+        def mk(k):
+            start = rng.randint(-30, 30)
+            xs = []
+            cur = start
+            for _ in range(k):
+                cur += rng.randint(1, 8)
+                xs.append(cur)
+            return xs
+
+        for _ in range(300):
+            n = rng.randint(1, 5)
+            m = rng.randint(1, 5)
+            A, B = mk(n), mk(m)
+            d = rng.randint(-20, 20)
+            tol = rng.randint(0, 8)
+            ga, gb = rng.randint(0, 4), rng.randint(0, 4)
+            obj, pairs = best_pairing_constrained(A, B, d, tol, ga, gb)
+            ref = None
+            for cand in all_order_preserving_matchings(n, m):
+                res = [A[i] - (B[j] + d) for (i, j) in cand]
+                if any(abs(r) > tol for r in res):
+                    continue
+                ok = True
+                for k in range(1, len(cand)):
+                    (pi, pj), (i, j) = cand[k - 1], cand[k]
+                    if i - pi - 1 > ga or j - pj - 1 > gb:
+                        ok = False
+                        break
+                if not ok:
+                    continue
+                score = (
+                    len(cand),
+                    -sum(abs(r) for r in res),
+                    -max((abs(r) for r in res), default=0),
+                    tuple(cand),
+                )
+                if ref is None or score > ref:
+                    ref = score
+            self.assertIsNotNone(ref)
+            self.assertEqual(obj, ref)
+
+    def test_global_constrained_fuzz_against_brute_force(self):
+        rng = random.Random(909090)
+
+        def mk(k):
+            start = rng.randint(-30, 30)
+            xs = []
+            cur = start
+            for _ in range(k):
+                cur += rng.randint(1, 8)
+                xs.append(cur)
+            return xs
+
+        for _ in range(120):
+            n = rng.randint(1, 5)
+            m = rng.randint(1, 5)
+            A, B = mk(n), mk(m)
+            lo = rng.randint(-12, 4)
+            hi = lo + rng.randint(0, 16)
+            tol = rng.randint(0, 6)
+            ga, gb = rng.randint(0, 3), rng.randint(0, 3)
+            res = solve(A, B, lo, hi, tol, 1, True, ga, gb)
+
+            best = None
+            bd = None
+            for d in range(lo, hi + 1):
+                for cand in all_order_preserving_matchings(n, m):
+                    rr = [A[i] - (B[j] + d) for (i, j) in cand]
+                    if any(abs(r) > tol for r in rr):
+                        continue
+                    ok = all(
+                        cand[k][0] - cand[k - 1][0] - 1 <= ga
+                        and cand[k][1] - cand[k - 1][1] - 1 <= gb
+                        for k in range(1, len(cand))
+                    )
+                    if not ok:
+                        continue
+                    score = (
+                        len(cand),
+                        -sum(abs(r) for r in rr),
+                        -max((abs(r) for r in rr), default=0),
+                        -d,
+                    )
+                    if best is None or score > best:
+                        best = score
+                        bd = d
+            self.assertIsNotNone(best)
+            sc = best
+            self.assertEqual(
+                (res.offset, res.pair_count,
+                 res.residual_abs_sum, res.max_abs_residual),
+                (bd, sc[0], -sc[1], -sc[2]),
+            )
+
+    def test_fuzz_larger_counts_within_6_24(self):        # Validated input-size regime (6..24 each); enumerating all matchings
         # is infeasible here, so the reference is a dense *offset scan* using
         # the same DP (already proven equal to full enumeration at a fixed
         # offset in test_dp_matches_enumeration_fixed_offset).  This still

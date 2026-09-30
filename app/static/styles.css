@@ -67,6 +67,14 @@ textarea:focus, input:focus { outline: 2px solid rgba(26,111,176,.35); border-co
 
 .actions { display: flex; align-items: center; gap: 14px; margin-top: 6px; }
 
+.gap-toggle { margin-top: 4px; }
+.checkbox-label { display: flex; align-items: flex-start; gap: 8px;
+  font-size: 13px; color: var(--ink); cursor: pointer; }
+.checkbox-label input { width: auto; margin-top: 3px; }
+.gap-fields { margin-top: 10px; }
+.gap-breach { background: var(--bad-bg); }
+.breach { font-weight: 700; color: var(--bad-ink); }
+
 button {
   font: inherit;
   font-weight: 600;

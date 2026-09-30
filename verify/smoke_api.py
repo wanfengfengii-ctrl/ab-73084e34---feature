@@ -98,6 +98,75 @@ def main() -> int:
     check(status == 400, "non-strict input rejected with 400")
     check("严格递增" in body.get("error", ""), "validation message returned")
 
+    # ---- Gap-limit DISABLED compatibility (default request) --------------
+    compat = {
+        "probe_a": [100, 200, 300, 400, 500, 600],
+        "probe_b": [100, 200, 300, 400, 500, 600],
+        "offset_min": 0,
+        "offset_max": 0,
+        "tolerance": 0,
+        "min_pairs": 6,
+    }
+    status, body = request("POST", "/api/calibrate", compat)
+    check(status == 200, "gap-disabled request HTTP 200")
+    check(body.get("gap_limit_enabled") is False, "gap limit defaults to disabled")
+    check(body.get("max_gap_a") is None and body.get("max_gap_b") is None,
+          "no per-side limits reported when disabled")
+    check(body.get("gap_segments") == [], "no gap segments when disabled")
+    check("broken_segments" not in body, "no break report when disabled")
+
+    # ---- Gap-limit ENABLED, sufficient -----------------------------------
+    enabled_ok = dict(compat, gap_limit_enabled=True, max_gap_a=0, max_gap_b=0)
+    status, body = request("POST", "/api/calibrate", enabled_ok)
+    check(status == 200, "gap-enabled sufficient request HTTP 200")
+    check(body.get("sufficient") is True, "gap-enabled result sufficient")
+    check(body.get("offset") == 0, "gap-enabled calibration offset returned")
+    check(body.get("pair_count") == 6, "gap-enabled all 6 paired")
+    segs = body.get("gap_segments", [])
+    check(len(segs) == 5, "five between-pair segments reported")
+    check(all(s["skipped_a"] == 0 and s["skipped_b"] == 0 for s in segs),
+          "every segment skips zero pulses")
+
+    # ---- Gap-limit ENABLED, insufficient due to a scattered coincidence --
+    # Four exact coincidences with two noise pulses between pairs 2 and 3 on
+    # each side: limit 1 breaks the chain into runs of at most 2 pairs.
+    gap_bad = {
+        "probe_a": [10, 20, 30, 40, 50, 60],
+        "probe_b": [10, 20, 33, 43, 50, 60],
+        "offset_min": 0,
+        "offset_max": 0,
+        "tolerance": 0,
+        "min_pairs": 4,
+        "gap_limit_enabled": True,
+        "max_gap_a": 1,
+        "max_gap_b": 1,
+    }
+    status, body = request("POST", "/api/calibrate", gap_bad)
+    check(status == 200, "gap-enabled insufficient request HTTP 200")
+    check(body.get("sufficient") is False, "gap-enabled result insufficient")
+    check(body.get("pair_count") == 2,
+          "actual constrained maximum pair count reported (2)")
+    check(body.get("offset") is None, "no calibration offset under gap limit")
+    check(body.get("pairs") == [], "no pairs presented as a calibration")
+    breaks = body.get("broken_segments", [])
+    check(len(breaks) == 1, "one breaking gap segment reported")
+    check(
+        breaks and breaks[0]["after_pair"] == 2
+        and breaks[0]["skipped_a"] == 2 and breaks[0]["skipped_b"] == 2,
+        "breaking segment located between pairs 2 and 3 with 2 skips/side",
+    )
+    check(bool(body.get("reason")) and "断裂" in body["reason"],
+          "Chinese break reason provided")
+    diag_segs = body.get("diagnostic", {}).get("gap_segments", [])
+    check(len(diag_segs) == 1 and len(body["diagnostic"]["pairs"]) == 2,
+          "diagnostic shows the constrained optimum's own segments")
+
+    # ---- Gap-limit validation --------------------------------------------
+    bad_gap = dict(gap_bad, max_gap_b=-1)
+    status, body = request("POST", "/api/calibrate", bad_gap)
+    check(status == 400, "negative gap limit rejected")
+    check(body.get("field") == "max_gap_b", "error field points at max_gap_b")
+
     print("SMOKE OK")
     return 0
 

@@ -52,6 +52,24 @@
       </div>
     </div>
 
+    <div class="field gap-toggle">
+      <label class="checkbox-label">
+        <input id="gapLimitEnabled" type="checkbox">
+        启用连续漏失上限（相邻两对符合事件之间，每侧跳过的脉冲数均不得越限；
+        首对之前、末对之后不计入）
+      </label>
+      <div id="gapFields" class="grid2 gap-fields" hidden>
+        <div class="field">
+          <label for="maxGapA">A 侧连续漏失上限（个脉冲）</label>
+          <input id="maxGapA" type="number" step="1" min="0" max="23" value="1">
+        </div>
+        <div class="field">
+          <label for="maxGapB">B 侧连续漏失上限（个脉冲）</label>
+          <input id="maxGapB" type="number" step="1" min="0" max="23" value="1">
+        </div>
+      </div>
+    </div>
+
     <div class="actions">
       <button id="submitBtn" type="button">提交联合校准</button>
       <span id="staleNote" class="stale-note" hidden>输入已修改，旧结论已失效，请重新提交。</span>
@@ -64,6 +82,7 @@
     <h2>校准结果</h2>
     <div id="verdict"></div>
     <div id="metrics" class="metrics"></div>
+    <div id="gapWrap"></div>
     <div id="pairsWrap"></div>
     <div class="grid2">
       <div id="unpairedA"></div>

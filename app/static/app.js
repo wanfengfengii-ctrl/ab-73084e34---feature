@@ -2,7 +2,10 @@
 
 const $ = (id) => document.getElementById(id);
 
-const fields = ["probeA", "probeB", "offsetMin", "offsetMax", "tolerance", "minPairs"];
+const fields = [
+  "probeA", "probeB", "offsetMin", "offsetMax", "tolerance", "minPairs",
+  "gapLimitEnabled", "maxGapA", "maxGapB",
+];
 
 function markStale() {
   // 旧结论立即失效：隐藏上一次结果，避免被误读为当前输入的结论。
@@ -13,6 +16,11 @@ function markStale() {
 
 fields.forEach((id) => {
   $(id).addEventListener("input", markStale);
+});
+
+$("gapLimitEnabled").addEventListener("change", () => {
+  $("gapFields").hidden = !$("gapLimitEnabled").checked;
+  markStale();
 });
 
 function parseTimes(text) {
@@ -70,15 +78,51 @@ function renderUnpaired(title, list) {
   return `<h3>${title}</h3><div class="chips">${chips}</div>`;
 }
 
+function renderGapSegments(r, segments, title, note, emptyText) {
+  if (!r.gap_limit_enabled) return "";
+  if (segments.length === 0) {
+    return `<h3>${title}</h3>
+      <p class="empty-note">${emptyText
+        || "配对数少于 2 对，无相邻配对之间的漏失区段"
+        + "（首对之前与末对之后的脉冲不计入约束）。"}</p>`;
+  }
+  const rows = segments.map((g) => {
+    const breachA = g.skipped_a > r.max_gap_a;
+    const breachB = g.skipped_b > r.max_gap_b;
+    const cls = (breachA || breachB) ? "gap-breach" : "";
+    const mark = (v, b) => b ? `<span class="breach">${v} ✕</span>` : v;
+    return `<tr class="${cls}">
+      <td>第 ${g.after_pair} 对 → 第 ${g.after_pair + 1} 对</td>
+      <td class="${breachA ? "res-neg" : ""}">${mark(g.skipped_a, breachA)}</td>
+      <td class="${breachB ? "res-neg" : ""}">${mark(g.skipped_b, breachB)}</td>
+      <td>${g.a_indices.map((i) => "#" + i).join(" ") || "—"}</td>
+      <td>${g.b_indices.map((i) => "#" + i).join(" ") || "—"}</td>
+    </tr>`;
+  }).join("");
+  return `<h3>${title}</h3>
+    ${note ? `<p class="diagnostic-note">${note}</p>` : ""}
+    <table>
+      <thead><tr><th>相邻符合事件</th><th>A 侧跳过脉冲数（上限 ${r.max_gap_a}）</th>
+      <th>B 侧跳过脉冲数（上限 ${r.max_gap_b}）</th><th>A 侧跳过序号</th>
+      <th>B 侧跳过序号</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table>`;
+}
+
 function renderResult(r) {
   const panel = $("resultPanel");
   panel.hidden = false;
+
+  const gapOn = !!r.gap_limit_enabled;
+  const gapDesc = gapOn
+    ? `（连续漏失上限：A 侧 ${r.max_gap_a}、B 侧 ${r.max_gap_b}）`
+    : "";
 
   if (r.sufficient) {
     $("verdict").innerHTML =
       `<div class="verdict ok">校准成立：最佳整数时钟偏移为
         <span style="font-variant-numeric:tabular-nums">${r.offset}</span> ns，
-        形成 ${r.pair_count} 对符合事件（门槛 ${r.min_pairs} 对）。</div>`;
+        形成 ${r.pair_count} 对符合事件（门槛 ${r.min_pairs} 对）${gapDesc}。</div>`;
     $("metrics").innerHTML =
       metric("最佳整数偏移 (ns)", r.offset) +
       metric("配对数", `${r.pair_count} / 门槛 ${r.min_pairs}`) +
@@ -86,10 +130,13 @@ function renderResult(r) {
       metric("最大残差绝对值 (ns)", r.max_abs_residual);
   } else {
     // 不伪造校准值：不把任何偏移作为校准结论展示。
+    const gapReason = gapOn
+      ? `启用连续漏失上限（A 侧 ${r.max_gap_a}、B 侧 ${r.max_gap_b}）后，`
+        + `满足约束的实际最大配对数仅为 ${r.pair_count} 对，低于门槛 ${r.min_pairs} 对。`
+      : `实际最大配对数为 <span style="font-variant-numeric:tabular-nums">${r.pair_count}</span>
+        对，低于最低配对数 ${r.min_pairs} 对。`;
     $("verdict").innerHTML =
-      `<div class="verdict bad">无法形成足够的符合事件：实际最大配对数为
-        <span style="font-variant-numeric:tabular-nums">${r.pair_count}</span>
-        对，低于最低配对数 ${r.min_pairs} 对。
+      `<div class="verdict bad">无法形成足够的符合事件：${gapReason}
         <span class="reason">${esc(r.reason || "")}</span></div>`;
     $("metrics").innerHTML =
       metric("实际最大配对数", `${r.pair_count} / 门槛 ${r.min_pairs}`) +
@@ -97,16 +144,42 @@ function renderResult(r) {
       metric("最大残差绝对值 (ns)", r.max_abs_residual);
   }
 
+  const diagPairs = (r.diagnostic && r.diagnostic.pairs) || [];
+  const shownPairs = r.sufficient ? r.pairs : diagPairs;
+  if (r.sufficient) {
+    $("gapWrap").innerHTML = renderGapSegments(
+      r, r.gap_segments,
+      "逐段漏失统计（相邻两对符合事件之间跳过的脉冲数）",
+      "首对之前与末对之后的脉冲不计入连续漏失约束。",
+    );
+  } else if (gapOn) {
+    $("gapWrap").innerHTML =
+      renderGapSegments(
+        r, r.broken_segments || [],
+        "造成断裂的漏失区段（无约束最优配对中越过上限的位置）",
+        "下列区段中至少一侧跳过脉冲数越限，联合求解时符合链必须在此断开。",
+        "无约束最优配对本身不存在越过漏失上限的相邻区段。",
+      )
+      + renderGapSegments(
+        r, (r.diagnostic && r.diagnostic.gap_segments) || [],
+        "约束下实际最大配对数方案的逐段漏失（诊断）",
+        "该方案满足全部连续漏失约束，但配对数低于门槛，不构成校准结论。",
+        "该方案配对数少于 2 对，无相邻配对之间的漏失区段。",
+      );
+  } else {
+    $("gapWrap").innerHTML = "";
+  }
   $("pairsWrap").innerHTML = r.sufficient
     ? renderPairs(r.pairs)
     : `<p class="diagnostic-note">以下为最大配对数（${r.pair_count} 对）的对齐明细，
         仅用于诊断，不构成校准结论，页面不给出校准偏移。</p>` +
-      renderPairs((r.diagnostic && r.diagnostic.pairs) || []);
+      renderPairs(shownPairs);
   $("unpairedA").innerHTML = renderUnpaired("未配对的 A 脉冲（序号 / 时间）", r.unpaired_a);
   $("unpairedB").innerHTML = renderUnpaired("未配对的 B 脉冲（序号 / 时间）", r.unpaired_b);
 }
 
 async function submit() {
+  const gapEnabled = $("gapLimitEnabled").checked;
   const payload = {
     probe_a: parseTimes($("probeA").value),
     probe_b: parseTimes($("probeB").value),
@@ -114,7 +187,12 @@ async function submit() {
     offset_max: $("offsetMax").value.trim(),
     tolerance: $("tolerance").value.trim(),
     min_pairs: $("minPairs").value.trim(),
+    gap_limit_enabled: gapEnabled,
   };
+  if (gapEnabled) {
+    payload.max_gap_a = $("maxGapA").value.trim();
+    payload.max_gap_b = $("maxGapB").value.trim();
+  }
 
   const btn = $("submitBtn");
   btn.disabled = true;

@@ -187,6 +187,143 @@ class ApiTests(unittest.TestCase):
             status, _, _ = h.get("/nope")
             self.assertEqual(status, 404)
 
+    def test_gap_limit_disabled_response_compatible(self):
+        # No gap fields in the request: the response keeps the old shape and
+        # only adds harmless explicit echo fields.
+        with ServerHarness() as h:
+            status, body = h.post({
+                "probe_a": [1, 2, 3, 4, 5, 6],
+                "probe_b": [1, 2, 3, 4, 5, 6],
+                "offset_min": 0, "offset_max": 0,
+                "tolerance": 0, "min_pairs": 6,
+            })
+            self.assertEqual(status, 200, body)
+            self.assertFalse(body["gap_limit_enabled"])
+            self.assertIsNone(body["max_gap_a"])
+            self.assertIsNone(body["max_gap_b"])
+            self.assertEqual(body["gap_segments"], [])
+            self.assertNotIn("broken_segments", body)
+
+    def test_gap_limit_enabled_sufficient_with_segments(self):
+        with ServerHarness() as h:
+            status, body = h.post({
+                "probe_a": [10, 20, 30, 40, 50, 60],
+                "probe_b": [10, 20, 30, 40, 50, 60],
+                "offset_min": 0, "offset_max": 0,
+                "tolerance": 0, "min_pairs": 6,
+                "gap_limit_enabled": True,
+                "max_gap_a": 0, "max_gap_b": 0,
+            })
+            self.assertEqual(status, 200, body)
+            self.assertTrue(body["sufficient"])
+            self.assertEqual(body["offset"], 0)
+            self.assertEqual(body["pair_count"], 6)
+            self.assertTrue(body["gap_limit_enabled"])
+            self.assertEqual((body["max_gap_a"], body["max_gap_b"]), (0, 0))
+            self.assertEqual(len(body["gap_segments"]), 5)
+            for seg in body["gap_segments"]:
+                self.assertEqual(
+                    (seg["skipped_a"], seg["skipped_b"]), (0, 0)
+                )
+
+    def test_gap_limit_enabled_insufficient_reports_breaks(self):
+        with ServerHarness() as h:
+            # Four coincidences scattered across noise; the middle adjacency
+            # skips two pulses on each side, breaching a limit of 1.
+            payload = {
+                "probe_a": [10, 20, 30, 40, 50, 60],
+                "probe_b": [10, 20, 33, 43, 50, 60],
+                "offset_min": 0, "offset_max": 0,
+                "tolerance": 0, "min_pairs": 4,
+                "gap_limit_enabled": True,
+                "max_gap_a": 1, "max_gap_b": 1,
+            }
+            status, body = h.post(payload)
+            self.assertEqual(status, 200, body)
+            self.assertFalse(body["sufficient"])
+            self.assertEqual(body["pair_count"], 2)
+            self.assertIsNone(body["offset"])
+            self.assertEqual(body["pairs"], [])
+            self.assertTrue(body["gap_limit_enabled"])
+            breaks = body["broken_segments"]
+            self.assertEqual(len(breaks), 1)
+            self.assertEqual(
+                (breaks[0]["after_pair"],
+                 breaks[0]["skipped_a"], breaks[0]["skipped_b"]),
+                (2, 2, 2),
+            )
+            self.assertEqual(breaks[0]["a_indices"], [3, 4])
+            self.assertEqual(breaks[0]["b_indices"], [3, 4])
+            self.assertIn("断裂", body["reason"])
+            # The diagnostic shows the actual constrained optimum's segments.
+            diag = body["diagnostic"]
+            self.assertIn("gap_segments", diag)
+            # The diagnostic itself must not leak a top-level calibration.
+            self.assertEqual(len(diag["pairs"]), 2)
+
+    def test_gap_limit_strings_accepted(self):
+        with ServerHarness() as h:
+            status, body = h.post({
+                "probe_a": "1, 2, 3, 4, 5, 6",
+                "probe_b": "1, 2, 3, 4, 5, 6",
+                "offset_min": "0", "offset_max": "0",
+                "tolerance": "0", "min_pairs": "6",
+                "gap_limit_enabled": "true",
+                "max_gap_a": "0", "max_gap_b": "0",
+            })
+            self.assertEqual(status, 200, body)
+            self.assertTrue(body["sufficient"])
+
+    def test_gap_limit_missing_values_rejected(self):
+        with ServerHarness() as h:
+            status, body = h.post({
+                "probe_a": [1, 2, 3, 4, 5, 6],
+                "probe_b": [1, 2, 3, 4, 5, 6],
+                "offset_min": 0, "offset_max": 0,
+                "tolerance": 0, "min_pairs": 1,
+                "gap_limit_enabled": True,
+            })
+            self.assertEqual(status, 400)
+            self.assertEqual(body["field"], "max_gap_a")
+
+    def test_gap_limit_negative_rejected(self):
+        with ServerHarness() as h:
+            status, body = h.post({
+                "probe_a": [1, 2, 3, 4, 5, 6],
+                "probe_b": [1, 2, 3, 4, 5, 6],
+                "offset_min": 0, "offset_max": 0,
+                "tolerance": 0, "min_pairs": 1,
+                "gap_limit_enabled": True,
+                "max_gap_a": -1, "max_gap_b": 1,
+            })
+            self.assertEqual(status, 400)
+            self.assertEqual(body["field"], "max_gap_a")
+
+    def test_gap_limit_too_large_rejected(self):
+        with ServerHarness() as h:
+            status, body = h.post({
+                "probe_a": [1, 2, 3, 4, 5, 6],
+                "probe_b": [1, 2, 3, 4, 5, 6],
+                "offset_min": 0, "offset_max": 0,
+                "tolerance": 0, "min_pairs": 1,
+                "gap_limit_enabled": True,
+                "max_gap_a": 1, "max_gap_b": 24,
+            })
+            self.assertEqual(status, 400)
+            self.assertEqual(body["field"], "max_gap_b")
+
+    def test_gap_limit_bad_flag_rejected(self):
+        with ServerHarness() as h:
+            status, body = h.post({
+                "probe_a": [1, 2, 3, 4, 5, 6],
+                "probe_b": [1, 2, 3, 4, 5, 6],
+                "offset_min": 0, "offset_max": 0,
+                "tolerance": 0, "min_pairs": 1,
+                "gap_limit_enabled": "yesplease",
+            })
+            self.assertEqual(status, 400)
+            self.assertEqual(body["field"], "gap_limit_enabled")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

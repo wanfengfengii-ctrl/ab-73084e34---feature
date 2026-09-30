@@ -15,6 +15,9 @@ OFFSET_MIN = -(10**12)
 OFFSET_MAX = 10**12
 TOL_MAX = 10**12
 MIN_PAIRS_MAX = MAX_PULSES
+# Between two consecutive pairs at most all but one pulse of a 24-pulse
+# record can be skipped on one side.
+GAP_LIMIT_MAX = MAX_PULSES - 1
 
 
 class ValidationError(ValueError):
@@ -117,6 +120,37 @@ def validate_payload(data: Any) -> dict:
             f"最低配对数不能超过 {MIN_PAIRS_MAX}", "min_pairs"
         )
 
+    enabled = data.get("gap_limit_enabled", False)
+    if isinstance(enabled, str):
+        if enabled.strip().lower() in ("true", "1", "yes", "on"):
+            enabled = True
+        elif enabled.strip().lower() in ("false", "0", "no", "off", ""):
+            enabled = False
+    if not isinstance(enabled, bool):
+        raise ValidationError(
+            "连续漏失上限开关必须是布尔值", "gap_limit_enabled"
+        )
+
+    max_gap_a = None
+    max_gap_b = None
+    if enabled:
+        max_gap_a = _coerce_int(
+            data.get("max_gap_a"), "max_gap_a", "A 侧连续漏失上限"
+        )
+        max_gap_b = _coerce_int(
+            data.get("max_gap_b"), "max_gap_b", "B 侧连续漏失上限"
+        )
+        for label, value, field in (
+            ("A 侧连续漏失上限", max_gap_a, "max_gap_a"),
+            ("B 侧连续漏失上限", max_gap_b, "max_gap_b"),
+        ):
+            if value < 0:
+                raise ValidationError(f"{label}不能为负", field)
+            if value > GAP_LIMIT_MAX:
+                raise ValidationError(
+                    f"{label}不能超过 {GAP_LIMIT_MAX}", field
+                )
+
     return {
         "A": probe_a,
         "B": probe_b,
@@ -124,4 +158,7 @@ def validate_payload(data: Any) -> dict:
         "offset_max": offset_max,
         "tolerance": tolerance,
         "min_pairs": min_pairs,
+        "gap_limit_enabled": enabled,
+        "max_gap_a": max_gap_a,
+        "max_gap_b": max_gap_b,
     }

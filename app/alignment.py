@@ -39,12 +39,26 @@ There are at most 4*n*m + 2 + O((n*m)^2) such values before filtering; with
 n, m <= 24 the co-order and |c - c'| <= 2T filters keep only a few thousand
 candidates (worst measured case under one second), and every visited offset is
 derived from pairing critical values -- never from scanning.
+
+Optional "consecutive gap" limits
+---------------------------------
+
+When enabled with per-side limits g_a, g_b >= 0, two consecutive matched
+pairs (i, j) < (i', j') may only be adjacent when both
+``i' - i - 1 <= g_a`` and ``j' - j - 1 <= g_b`` (pulses skipped between
+them); pulses before the first pair and after the last pair are free.  This
+is a purely *index* constraint, so it does not change the candidate-offset
+set above: at every candidate offset the matching problem is solved jointly
+as a chain DP with rectangle-maximum predecessor queries (monotone deques,
+O(n*m) per offset) -- never by taking the unconstrained optimum and deleting
+broken segments afterwards.
 """
 
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass
-from typing import List, Optional, Sequence, Tuple
+from typing import Deque, List, Optional, Sequence, Tuple
 
 # A pairing's lexicographic objective used *inside* the DP, maximised:
 #   (pair_count, -abs_sum, -max_abs_residual, index_key)
@@ -125,6 +139,141 @@ def best_pairing_at(
     return final, pairs
 
 
+def best_pairing_constrained(
+    A: Sequence[int],
+    B: Sequence[int],
+    offset: int,
+    tol: int,
+    max_gap_a: int,
+    max_gap_b: int,
+) -> Tuple[Objective, List[Tuple[int, int]]]:
+    """Optimal order-preserving matching with consecutive-gap limits.
+
+    For two consecutive matched pairs ``(i, j)`` and ``(i', j')`` (i < i',
+    j < j'), the pulses skipped on each side are ``i' - i - 1`` on A and
+    ``j' - j - 1`` on B; both must be within the given limits.  Pulses
+    before the first pair and after the last pair are unrestricted.
+
+    The matching is solved jointly as a chain DP: a state is the best chain
+    ending in edge ``(i, j)``; its predecessor is the best chain ending in
+    the rectangle ``[i-ga-1, i-1] x [j-gb-1, j-1]``.  Each column holds a
+    monotone deque over its active row window, and a global deque over the
+    active columns answers the rectangle maximum in amortised O(1), so the
+    whole DP is O(n*m).
+    """
+    n = len(A)
+    m = len(B)
+
+    # best[i][j] is the lightweight objective of the best chain whose last
+    # edge is (i, j), or None when (i, j) is infeasible at this offset.
+    best: List[List[Optional[Objective]]] = [
+        [None] * m for _ in range(n)
+    ]
+    parent: List[List[Optional[Tuple[int, int]]]] = [
+        [None] * m for _ in range(n)
+    ]
+
+    # Per-column (j) structures for the row window of start predecessors:
+    #   col_val[j][i] = best[i][j] (None if empty),
+    #   col_deq[j]     = deque of rows i' in the current window
+    #                    [max(0, i-ga-1), i-1], values strictly decreasing.
+    col_val: List[List[Optional[Objective]]] = [
+        [None] * n for _ in range(m)
+    ]
+    col_deq: List[Deque[int]] = [deque() for _ in range(m)]
+    # Global deque of columns j' in [max(0, j-gb-1), j-1] whose *window*
+    # maximum col_val[j'][col_deq[j'][0]] is strictly decreasing.
+    global_deq: Deque[int] = deque()
+
+    def col_max(j: int) -> Optional[Objective]:
+        dq = col_deq[j]
+        return col_val[j][dq[0]] if dq else None
+
+    def col_push(j: int) -> None:
+        """Insert column j into the global deque (its window max is final)."""
+        v = col_max(j)
+        if v is None:
+            return
+        while global_deq and col_max(global_deq[-1]) <= v:
+            global_deq.pop()
+        global_deq.append(j)
+
+    for i in range(n):
+        a = A[i]
+        row_lo = max(0, i - max_gap_a - 1)
+
+        # Prepare every column's row window [row_lo, row_hi] before the
+        # global deque (reset per row) is built left to right.
+        for j in range(m):
+            dq = col_deq[j]
+            if i > 0:
+                # Extend the window with newly eligible start row i-1.
+                sr = i - 1
+                v = col_val[j][sr]
+                if v is not None:
+                    while dq and col_val[j][dq[-1]] <= v:
+                        dq.pop()
+                    dq.append(sr)
+            # Drop starts that fell below the window's lower edge.
+            while dq and dq[0] < row_lo:
+                dq.popleft()
+
+        global_deq.clear()
+        for j in range(m):
+            e = a - B[j] - offset
+            if -tol <= e <= tol:
+                pred: Optional[Objective] = None
+                pred_pos: Optional[Tuple[int, int]] = None
+                if global_deq:
+                    pj = global_deq[0]
+                    pred = col_max(pj)
+                    assert pred is not None
+                    pred_pos = (col_deq[pj][0], pj)
+                if pred is None:
+                    chain = (1, -(abs(e)), -abs(e), ((i, j),))
+                else:
+                    assert pred_pos is not None
+                    ae = e if e >= 0 else -e
+                    chain = (
+                        pred[0] + 1,
+                        pred[1] - ae,
+                        min(pred[2], -ae),
+                        pred[3] + ((i, j),),
+                    )
+                best[i][j] = chain
+                parent[i][j] = pred_pos
+                col_val[j][i] = chain
+
+            # Column j becomes an eligible predecessor for later columns;
+            # its window over this row is final once computed above.
+            col_push(j)
+
+            # The next cell j+1 may only start at columns >= j+1-gb-1.
+            next_lo = max(0, (j + 1) - max_gap_b - 1)
+            while global_deq and global_deq[0] < next_lo:
+                global_deq.popleft()
+
+    # Pick the globally best chain endpoint (the trailing pulses are free).
+    end: Optional[Tuple[int, int]] = None
+    final: Optional[Objective] = None
+    for i in range(n):
+        for j in range(m):
+            v = best[i][j]
+            if v is not None and (final is None or v > final):
+                final = v
+                end = (i, j)
+
+    pairs: List[Tuple[int, int]] = []
+    if end is not None:
+        pos: Optional[Tuple[int, int]] = end
+        while pos is not None:
+            pairs.append(pos)
+            pos = parent[pos[0]][pos[1]]
+        pairs.reverse()
+    chain_obj: Objective = final if final is not None else _empty_objective()
+    return chain_obj, pairs
+
+
 def _residual_matrix(A: Sequence[int], B: Sequence[int], offset: int):
     return [[a - b - offset for b in B] for a in A]
 
@@ -200,6 +349,36 @@ class Unpaired:
 
 
 @dataclass(frozen=True)
+class GapSegment:
+    """Pulses skipped between two consecutive matched pairs.
+
+    ``after_pair`` is the 1-based ordinal of the earlier matched pair; the
+    skipped pulses are A indices ``(index_a_of_that_pair, index_a_of_next)``
+    (exclusive on both ends), likewise for B.
+    """
+
+    after_pair: int
+    skipped_a: int
+    skipped_b: int
+    a_indices: Tuple[int, ...]  # 1-based input indices of skipped pulses
+    b_indices: Tuple[int, ...]
+
+    def exceeds(self, ga: Optional[int], gb: Optional[int]) -> bool:
+        return (ga is not None and self.skipped_a > ga) or (
+            gb is not None and self.skipped_b > gb
+        )
+
+    def to_dict(self) -> dict:
+        return {
+            "after_pair": self.after_pair,
+            "skipped_a": self.skipped_a,
+            "skipped_b": self.skipped_b,
+            "a_indices": list(self.a_indices),
+            "b_indices": list(self.b_indices),
+        }
+
+
+@dataclass(frozen=True)
 class CalibrationResult:
     offset: int
     pair_count: int
@@ -211,6 +390,15 @@ class CalibrationResult:
     min_pairs: int
     sufficient: bool
     reason: Optional[str]
+    gap_limit_enabled: bool = False
+    max_gap_a: Optional[int] = None
+    max_gap_b: Optional[int] = None
+    # Skipped counts per segment between consecutive pairs of the winning
+    # matching (empty when fewer than two pairs).
+    gap_segments: Tuple[GapSegment, ...] = ()
+    # Segments of the unconstrained optimum that violate the gap limits; the
+    # constrained chain length that replaces them is reported separately.
+    broken_segments: Tuple[GapSegment, ...] = ()
 
     def to_dict(self) -> dict:
         pairs = [
@@ -238,22 +426,56 @@ class CalibrationResult:
             "min_pairs": self.min_pairs,
             "sufficient": self.sufficient,
             "reason": self.reason,
+            "gap_limit_enabled": self.gap_limit_enabled,
+            "max_gap_a": self.max_gap_a,
+            "max_gap_b": self.max_gap_b,
+            "gap_segments": [g.to_dict() for g in self.gap_segments],
         }
         if not self.sufficient:
             # No calibration value may be presented as a conclusion.  The best
             # count-aligned offset and its pairs survive only as an explicitly
             # labelled diagnostic, useful for explaining the shortfall.
-            response["offset"] = None
-            response["pairs"] = []
-            response["diagnostic"] = {
+            diag = {
                 "note": "未达到最低配对数，以下偏移与配对仅为最大配对数对齐诊断，"
                         "不是校准结论。",
                 "offset": self.offset,
                 "residual_abs_sum": self.residual_abs_sum,
                 "max_abs_residual": self.max_abs_residual,
                 "pairs": pairs,
+                "gap_segments": [g.to_dict() for g in self.gap_segments],
             }
+            if self.gap_limit_enabled and self.broken_segments:
+                diag["broken_segments"] = [
+                    g.to_dict() for g in self.broken_segments
+                ]
+            response["offset"] = None
+            response["pairs"] = []
+            response["diagnostic"] = diag
+            if self.gap_limit_enabled and self.broken_segments:
+                response["broken_segments"] = [
+                    g.to_dict() for g in self.broken_segments
+                ]
         return response
+
+
+def _gap_segments(
+    pairs: Sequence[Tuple[int, int]]
+) -> Tuple[GapSegment, ...]:
+    """Skipped-pulse counts between consecutive matched pairs."""
+    segs: List[GapSegment] = []
+    for k in range(1, len(pairs)):
+        pi, pj = pairs[k - 1]
+        i, j = pairs[k]
+        segs.append(
+            GapSegment(
+                after_pair=k,  # 1-based ordinal of the earlier pair
+                skipped_a=i - pi - 1,
+                skipped_b=j - pj - 1,
+                a_indices=tuple(range(pi + 2, i + 1)),
+                b_indices=tuple(range(pj + 2, j + 1)),
+            )
+        )
+    return tuple(segs)
 
 
 def solve(
@@ -263,12 +485,29 @@ def solve(
     offset_max: int,
     tolerance: int,
     min_pairs: int,
+    gap_limit_enabled: bool = False,
+    max_gap_a: Optional[int] = None,
+    max_gap_b: Optional[int] = None,
 ) -> CalibrationResult:
     """Solve the joint offset / pairing problem exactly.
+
+    When ``gap_limit_enabled`` is true, the consecutive-skipped-pulse limits
+    are solved *jointly* with the integer offset and the order-preserving
+    one-to-one matching: every candidate offset is evaluated by the chain DP
+    directly, never by taking the unconstrained optimum and deleting breaks.
 
     Inputs are assumed to have been validated by the caller.
     """
     lo, hi = offset_min, offset_max
+
+    def evaluate(d: int):
+        if gap_limit_enabled:
+            assert max_gap_a is not None and max_gap_b is not None
+            return best_pairing_constrained(
+                A, B, d, tolerance, max_gap_a, max_gap_b
+            )
+        c = _residual_matrix(A, B, d)
+        return best_pairing_at(c, tolerance)
 
     # Global lexicographic record: (count, -cost, -max_abs, -offset)
     # maximised; the matching itself is re-derived canonically at the winning
@@ -277,8 +516,7 @@ def solve(
     best_offset = lo
 
     for d in _candidate_offsets(A, B, tolerance, lo, hi):
-        c = [[a - b - d for b in B] for a in A]
-        obj, _pairs = best_pairing_at(c, tolerance)
+        obj, _pairs = evaluate(d)
         count, neg_cost, neg_max_abs, _key = obj
 
         score = (count, neg_cost, neg_max_abs, -d)
@@ -289,8 +527,7 @@ def solve(
     assert best_score is not None
 
     # Re-derive the canonical matching at the winning offset.
-    c = _residual_matrix(A, B, best_offset)
-    obj, pairs = best_pairing_at(c, tolerance)
+    obj, pairs = evaluate(best_offset)
 
     pair_objs = tuple(
         Pair(
@@ -319,15 +556,71 @@ def solve(
     abs_sum = sum(abs(p.residual) for p in pair_objs)
     max_abs = max((abs(p.residual) for p in pair_objs), default=0)
 
-    sufficient = count >= min_pairs
-    reason: Optional[str] = None
-    if not sufficient:
-        reason = (
-            f"在偏移区间 [{offset_min}, {offset_max}] 纳秒、符合容差 "
-            f"±{tolerance} 纳秒内，两台探头最多只能形成 {count} 对符合事件"
-            f"（要求至少 {min_pairs} 对），无法形成足够的符合事件，"
-            "故不给出校准结论。"
-        )
+    gap_segments = _gap_segments(pairs) if gap_limit_enabled else ()
+
+    broken_segments: Tuple[GapSegment, ...] = ()
+    if gap_limit_enabled:
+        assert max_gap_a is not None and max_gap_b is not None
+        sufficient = count >= min_pairs
+        if sufficient:
+            reason = None
+        else:
+            # Explain the shortfall with the unconstrained optimum's segments
+            # that breach the limits: this is where the chain would break.
+            # The unconstrained optimum is solved only here (the shortfall
+            # path); it never takes part in the constrained decision, so this
+            # is not a "take the optimum and cut it" pipeline.
+            unc_score: Optional[Tuple[int, int, int, int]] = None
+            unc_offset = lo
+            for d in _candidate_offsets(A, B, tolerance, lo, hi):
+                c = _residual_matrix(A, B, d)
+                u_obj, _ = best_pairing_at(c, tolerance)
+                u_score = (u_obj[0], u_obj[1], u_obj[2], -d)
+                if unc_score is None or u_score > unc_score:
+                    unc_score = u_score
+                    unc_offset = d
+            _, unc_pairs = best_pairing_at(
+                _residual_matrix(A, B, unc_offset), tolerance
+            )
+            broken_segments = tuple(
+                g
+                for g in _gap_segments(unc_pairs)
+                if g.exceeds(max_gap_a, max_gap_b)
+            )
+            limit_txt = (
+                f"A 侧连续漏失上限 {max_gap_a}、B 侧 {max_gap_b}"
+            )
+            if broken_segments:
+                detail = "；".join(
+                    f"第 {g.after_pair} 对与第 {g.after_pair + 1} 对之间"
+                    f"A 侧跳过 {g.skipped_a} 个、B 侧跳过 {g.skipped_b} 个脉冲"
+                    for g in broken_segments
+                )
+                reason = (
+                    f"启用{limit_txt}后，在偏移区间 [{offset_min}, {offset_max}]"
+                    f" 纳秒、符合容差 ±{tolerance} 纳秒内，满足连续漏失约束的"
+                    f"符合事件最多只有 {count} 对（要求至少 {min_pairs} 对）。"
+                    f"无约束最优配对在以下区段越过漏失上限而发生断裂：{detail}；"
+                    "首对之前与末对之后的脉冲不计入约束。"
+                    "故不给出校准结论。"
+                )
+            else:
+                reason = (
+                    f"启用{limit_txt}后，在偏移区间 [{offset_min}, {offset_max}]"
+                    f" 纳秒、符合容差 ±{tolerance} 纳秒内，满足连续漏失约束的"
+                    f"符合事件最多只有 {count} 对（要求至少 {min_pairs} 对），"
+                    "无法形成足够的符合事件，故不给出校准结论。"
+                )
+    else:
+        sufficient = count >= min_pairs
+        reason: Optional[str] = None
+        if not sufficient:
+            reason = (
+                f"在偏移区间 [{offset_min}, {offset_max}] 纳秒、符合容差 "
+                f"±{tolerance} 纳秒内，两台探头最多只能形成 {count} 对符合事件"
+                f"（要求至少 {min_pairs} 对），无法形成足够的符合事件，"
+                "故不给出校准结论。"
+            )
 
     return CalibrationResult(
         offset=best_offset,
@@ -340,4 +633,9 @@ def solve(
         min_pairs=min_pairs,
         sufficient=sufficient,
         reason=reason,
+        gap_limit_enabled=gap_limit_enabled,
+        max_gap_a=max_gap_a if gap_limit_enabled else None,
+        max_gap_b=max_gap_b if gap_limit_enabled else None,
+        gap_segments=gap_segments,
+        broken_segments=broken_segments,
     )
