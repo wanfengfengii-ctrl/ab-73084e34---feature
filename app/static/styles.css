@@ -145,6 +145,34 @@ h3 { font-size: 14px; margin: 10px 0 6px; }
   color: var(--muted);
   margin: 0 0 12px;
 }
+
+.panel-sub {
+  background: #f8fafc;
+  padding: 12px 14px;
+  margin-top: 4px;
+}
+.checkbox-line {
+  display: flex;
+  gap: 9px;
+  align-items: flex-start;
+  font-size: 14px;
+  cursor: pointer;
+}
+.checkbox-line input { width: auto; margin-top: 3px; }
+.gap-inputs { margin-top: 12px; }
+
+.segment-card {
+  border: 1px solid var(--line);
+  border-left: 4px solid var(--accent);
+  border-radius: 8px;
+  padding: 8px 14px 10px;
+  margin: 10px 0;
+  background: #fcfdfe;
+}
+.segment-card h4 { font-size: 14px; margin: 8px 0 6px; }
+
+.gap-ok { color: var(--ok-ink); font-weight: 600; }
+.gap-bad { color: var(--bad-ink); font-weight: 700; }
 .spinner {
   display: inline-block; width: 14px; height: 14px;
   border: 2px solid rgba(255,255,255,.5); border-top-color: #fff;

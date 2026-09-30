@@ -187,6 +187,132 @@ class ApiTests(unittest.TestCase):
             status, _, _ = h.get("/nope")
             self.assertEqual(status, 404)
 
+    # -- consecutive-miss cap ---------------------------------------------
+    def _two_clusters_payload(self, **overrides):
+        # Same fixture as CappedSolverTests: two coincidence clusters of 4,
+        # 5 mutually unpairable noise pulses per side between them.
+        c1 = [0, 10, 20, 30]
+        noise_a = [60, 68, 76, 84, 92]
+        c2 = [200, 210, 220, 230]
+        A = c1 + noise_a + c2
+        B = [x + 2 for x in c1] + [120, 128, 136, 144, 152] \
+            + [x + 2 for x in c2]
+        payload = {
+            "probe_a": A,
+            "probe_b": B,
+            "offset_min": -10,
+            "offset_max": 10,
+            "tolerance": 3,
+            "min_pairs": 7,
+        }
+        payload.update(overrides)
+        return payload
+
+    def test_gap_limit_disabled_is_backward_compatible(self):
+        with ServerHarness() as h:
+            # Explicitly disabled and omitted both behave like the original.
+            for extra in ({}, {"gap_limit_enabled": False}):
+                payload = self._two_clusters_payload(**extra)
+                status, body = h.post(payload)
+                self.assertEqual(status, 200, body)
+                self.assertTrue(body["sufficient"])
+                self.assertEqual(body["offset"], -2)
+                self.assertEqual(body["pair_count"], 8)
+                self.assertNotIn("gap_limits", body)
+                self.assertNotIn("segments", body)
+
+    def test_gap_limit_enabled_sufficient_shows_segments(self):
+        with ServerHarness() as h:
+            payload = self._two_clusters_payload(
+                min_pairs=4,
+                gap_limit_enabled=True,
+                max_skipped_a=4,
+                max_skipped_b=4,
+            )
+            status, body = h.post(payload)
+            self.assertEqual(status, 200, body)
+            self.assertTrue(body["sufficient"])
+            self.assertEqual(body["offset"], -2)
+            self.assertEqual(body["gap_limits"], {
+                "enabled": True, "max_skipped_a": 4, "max_skipped_b": 4,
+            })
+            self.assertEqual(len(body["segments"]), 1)
+            self.assertEqual(body["segments"][0]["pair_count"], 4)
+            self.assertEqual(body["breaks"], [])
+
+    def test_gap_limit_enabled_insufficient_reports_fracture(self):
+        with ServerHarness() as h:
+            payload = self._two_clusters_payload(
+                gap_limit_enabled=True,
+                max_skipped_a=4,
+                max_skipped_b=4,
+            )
+            status, body = h.post(payload)
+            self.assertEqual(status, 200, body)
+            self.assertFalse(body["sufficient"])
+            # No calibration offset on the page/API surface.
+            self.assertIsNone(body["offset"])
+            self.assertEqual(body["pairs"], [])
+            self.assertEqual(body["pair_count"], 4)
+            self.assertIn("连续漏失上限", body["reason"])
+            diag = body["diagnostic"]
+            fracture = diag["fracture"]
+            self.assertEqual(fracture["pair_count"], 8)
+            self.assertEqual(
+                [s["pair_count"] for s in fracture["segments"]], [4, 4]
+            )
+            br = fracture["breaks"][0]
+            self.assertEqual(br["skipped_a"], 5)
+            self.assertEqual(br["skipped_b"], 5)
+            self.assertTrue(br["a_exceeded"] and br["b_exceeded"])
+
+    def test_gap_limit_zero_accepted(self):
+        with ServerHarness() as h:
+            payload = self._two_clusters_payload(
+                min_pairs=1,
+                gap_limit_enabled=True,
+                max_skipped_a=0,
+                max_skipped_b=0,
+            )
+            status, body = h.post(payload)
+            self.assertEqual(status, 200, body)
+            self.assertEqual(
+                body["gap_limits"]["max_skipped_a"], 0
+            )
+
+    def test_gap_limit_enabled_requires_both_limits(self):
+        with ServerHarness() as h:
+            payload = self._two_clusters_payload(
+                gap_limit_enabled=True, max_skipped_a=2,
+            )
+            status, body = h.post(payload)
+            self.assertEqual(status, 400)
+            self.assertEqual(body["field"], "max_skipped_b")
+
+    def test_negative_gap_limit_rejected(self):
+        with ServerHarness() as h:
+            payload = self._two_clusters_payload(
+                gap_limit_enabled=True,
+                max_skipped_a=-1,
+                max_skipped_b=2,
+            )
+            status, body = h.post(payload)
+            self.assertEqual(status, 400)
+            self.assertIn("不能为负", body["error"])
+            self.assertEqual(body["field"], "max_skipped_a")
+
+    def test_string_gap_limit_inputs_accepted(self):
+        with ServerHarness() as h:
+            payload = self._two_clusters_payload(
+                min_pairs=4,
+                gap_limit_enabled="true",
+                max_skipped_a="4",
+                max_skipped_b="4",
+            )
+            status, body = h.post(payload)
+            self.assertEqual(status, 200, body)
+            self.assertTrue(body["sufficient"])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

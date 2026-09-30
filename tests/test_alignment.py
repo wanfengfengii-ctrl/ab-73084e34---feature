@@ -13,7 +13,7 @@ import random
 import unittest
 from itertools import combinations
 
-from app.alignment import best_pairing_at, solve
+from app.alignment import best_pairing_at, constrained_pairing_at, solve
 
 
 def all_order_preserving_matchings(n, m):
@@ -21,6 +21,16 @@ def all_order_preserving_matchings(n, m):
         for ia in combinations(range(n), k):
             for jb in combinations(range(m), k):
                 yield list(zip(ia, jb))
+
+
+def gaps_respect_caps(pairs, max_skip_a, max_skip_b):
+    """Only gaps *between consecutive pairs* are constrained."""
+    for (i1, j1), (i2, j2) in zip(pairs, pairs[1:]):
+        if i2 - i1 - 1 > max_skip_a:
+            return False
+        if j2 - j1 - 1 > max_skip_b:
+            return False
+    return True
 
 
 def brute_force(A, B, lo, hi, tol, min_pairs):
@@ -36,6 +46,26 @@ def brute_force(A, B, lo, hi, tol, min_pairs):
             maxabs = max((abs(r) for r in residuals), default=0)
             key = tuple(pairs)
             score = (count, -cost, -maxabs, -d, key)
+            if best is None or score > best:
+                best = score
+                best_payload = (d, pairs, count, cost, maxabs)
+    return best_payload
+
+
+def brute_force_capped(A, B, lo, hi, tol, max_skip_a, max_skip_b):
+    best = None
+    best_payload = None
+    for d in range(lo, hi + 1):
+        for pairs in all_order_preserving_matchings(len(A), len(B)):
+            residuals = [A[i] - (B[j] + d) for (i, j) in pairs]
+            if any(abs(r) > tol for r in residuals):
+                continue
+            if not gaps_respect_caps(pairs, max_skip_a, max_skip_b):
+                continue
+            count = len(pairs)
+            cost = sum(abs(r) for r in residuals)
+            maxabs = max((abs(r) for r in residuals), default=0)
+            score = (count, -cost, -maxabs, -d, tuple(pairs))
             if best is None or score > best:
                 best = score
                 best_payload = (d, pairs, count, cost, maxabs)
@@ -261,6 +291,222 @@ class SolverTests(unittest.TestCase):
             self.assertEqual(res.pair_count, ref_obj[0])
             self.assertEqual(res.residual_abs_sum, -ref_obj[1])
             self.assertEqual(res.max_abs_residual, -ref_obj[2])
+
+
+class CappedSolverTests(unittest.TestCase):
+    def _two_cluster_data(self):
+        # Two dense coincidence clusters (4 each), 5 unmatched noise pulses
+        # on each side in between.  The noise values lie strictly between
+        # the clusters (so both lists are increasing) but are mutually far
+        # beyond tolerance + the whole offset interval, so they never pair.
+        # Uncapped LCS joins all 8 pairs by skipping 5 pulses between 4 and 5.
+        c1 = [0, 10, 20, 30]
+        noise_a = [60, 68, 76, 84, 92]
+        c2 = [200, 210, 220, 230]
+        A = c1 + noise_a + c2
+        B = [x + 2 for x in c1] + [120, 128, 136, 144, 152] \
+            + [x + 2 for x in c2]
+        return A, B
+
+    def test_uncapsulated_request_matches_original(self):
+        # No cap arguments: original problem, original response shape.
+        A, B = self._two_cluster_data()
+        res = solve(A, B, -10, 10, 3, 7)
+        self.assertTrue(res.sufficient)
+        self.assertEqual(res.offset, -2)
+        self.assertEqual(res.pair_count, 8)
+        self.assertFalse(res.gap_limit_enabled)
+        self.assertEqual(res.segments, ())
+        self.assertNotIn("gap_limits", res.to_dict())
+
+    def test_cap_blocks_scattered_long_chain(self):
+        A, B = self._two_cluster_data()
+        res = solve(A, B, -10, 10, 3, 7, max_skipped_a=4, max_skipped_b=4)
+        # The cap is part of the joint optimisation: the best *cap-respecting*
+        # chain has only 4 pairs, below the 7-pair threshold.
+        self.assertFalse(res.sufficient)
+        self.assertEqual(res.pair_count, 4)
+        self.assertTrue(res.gap_limit_enabled)
+        # No calibration offset is given away.
+        payload = res.to_dict()
+        self.assertIsNone(payload["offset"])
+        self.assertEqual(payload["pairs"], [])
+        # Answer is one cap-respecting chain with no breaking gap.
+        self.assertEqual(len(res.segments), 1)
+        self.assertEqual(res.breaks, ())
+        for (p1, p2) in zip(res.pairs, res.pairs[1:]):
+            self.assertLessEqual(
+                p2.index_a - p1.index_a - 1, 4
+            )
+            self.assertLessEqual(
+                p2.index_b - p1.index_b - 1, 4
+            )
+
+    def test_fracture_reports_the_breaking_miss_section(self):
+        A, B = self._two_cluster_data()
+        res = solve(A, B, -10, 10, 3, 7, max_skipped_a=4, max_skipped_b=4)
+        payload = res.to_dict()
+        fracture = payload["diagnostic"]["fracture"]
+        # The unconstrained 8-pair alignment is segmented by the caps...
+        self.assertEqual(fracture["pair_count"], 8)
+        self.assertEqual(
+            [s["pair_count"] for s in fracture["segments"]], [4, 4]
+        )
+        # ...and exactly one break carries the per-side skipped counts.
+        self.assertEqual(len(fracture["breaks"]), 1)
+        br = fracture["breaks"][0]
+        self.assertEqual(br["skipped_a"], 5)
+        self.assertEqual(br["skipped_b"], 5)
+        self.assertFalse(br["a_within_limit"])
+        self.assertFalse(br["b_within_limit"])
+        self.assertTrue(br["a_exceeded"])
+        self.assertTrue(br["b_exceeded"])
+        self.assertEqual(br["after_segment"], 1)
+        self.assertEqual(br["before_segment"], 2)
+        self.assertIn("断裂", res.reason)
+        self.assertIn("5", res.reason)
+
+    def test_segments_show_internal_skip_counts(self):
+        A, B = self._two_cluster_data()
+        # Threshold 4: capped optimum (4 pairs) is sufficient; per-gap skip
+        # counts inside the single segment must be reported.
+        res = solve(A, B, -10, 10, 3, 4, max_skipped_a=4, max_skipped_b=4)
+        self.assertTrue(res.sufficient)
+        self.assertEqual(len(res.segments), 1)
+        seg = res.segments[0]
+        self.assertEqual(seg.pair_count, 4)
+        self.assertEqual(seg.internal_skipped_a, 0)
+        self.assertEqual(seg.internal_skipped_b, 0)
+        self.assertTrue(all(p.segment == 1 for p in res.pairs))
+        payload = res.to_dict()
+        # Sufficient result exposes the offset, no diagnostic block.
+        self.assertEqual(payload["offset"], -2)
+        self.assertNotIn("diagnostic", payload)
+        self.assertEqual(payload["gap_limits"]["max_skipped_a"], 4)
+        self.assertEqual(payload["gap_limits"]["max_skipped_b"], 4)
+
+    def test_prefix_and_suffix_pulses_are_free(self):
+        # Many unmatched pulses before the first / after the last pair must
+        # not count against even a zero cap (both lists strictly increasing).
+        A = [10, 20, 30, 40, 50, 60, 70, 80, 90, 100]
+        B = [1, 2, 40, 50, 60, 70, 5000, 5010, 5020, 5030]
+        res = solve(A, B, -2, 2, 0, 4, max_skipped_a=0, max_skipped_b=0)
+        self.assertTrue(res.sufficient, res.reason)
+        self.assertEqual(res.pair_count, 4)
+        self.assertEqual(
+            [(p.index_a, p.index_b) for p in res.pairs],
+            [(4, 3), (5, 4), (6, 5), (7, 6)],
+        )
+        self.assertEqual(len(res.unpaired_a), 6)  # 3 before + 3 after
+        self.assertEqual(len(res.unpaired_b), 6)  # 2 before + 4 after
+
+    def test_asymmetric_side_caps(self):
+        # The 3rd pair skips 3 A pulses (30,40,50) but 0 B pulses between
+        # pair 2 and pair 3, so the two side limits bind independently.
+        A = [10, 20, 30, 40, 50, 60]
+        B = [10, 20, 60]
+        generous = solve(A, B, -1, 1, 0, 3,
+                         max_skipped_a=10, max_skipped_b=10)
+        self.assertTrue(generous.sufficient)
+        self.assertEqual(generous.pair_count, 3)
+        # B cap alone allows the gap (0 B pulses skipped)...
+        b_only = solve(A, B, -1, 1, 0, 3,
+                       max_skipped_a=10, max_skipped_b=0)
+        self.assertTrue(b_only.sufficient)
+        self.assertEqual(b_only.pair_count, 3)
+        # ...while an A cap below 3 breaks the chain.
+        a_tight = solve(A, B, -1, 1, 0, 3,
+                        max_skipped_a=2, max_skipped_b=10)
+        self.assertFalse(a_tight.sufficient)
+        self.assertEqual(a_tight.pair_count, 2)
+
+    def test_constrained_dp_matches_enumeration_fixed_offset(self):
+        rng = random.Random(4321)
+        for _ in range(400):
+            n = rng.randint(1, 5)
+            m = rng.randint(1, 5)
+            A = make_increasing(rng, n, 40)
+            B = make_increasing(rng, m, 40)
+            d = rng.randint(-15, 15)
+            tol = rng.randint(0, 10)
+            ka = rng.randint(0, 4)
+            kb = rng.randint(0, 4)
+            c = [[a - b - d for b in B] for a in A]
+            obj, pairs = constrained_pairing_at(c, tol, ka, kb)
+            ref = None
+            for cand in all_order_preserving_matchings(n, m):
+                res = [A[i] - (B[j] + d) for (i, j) in cand]
+                if any(abs(r) > tol for r in res):
+                    continue
+                if not gaps_respect_caps(cand, ka, kb):
+                    continue
+                score = (
+                    len(cand),
+                    -sum(abs(r) for r in res),
+                    -max((abs(r) for r in res), default=0),
+                    tuple(cand),
+                )
+                if ref is None or score > ref:
+                    ref = score
+            self.assertIsNotNone(ref)
+            self.assertEqual(obj, ref)
+            self.assertEqual(pairs, [tuple(x) for x in ref[3]])
+
+    def test_fuzz_capped_solver_against_brute_force(self):
+        rng = random.Random(20260931)
+        for _ in range(800):
+            n = rng.randint(1, 5)
+            m = rng.randint(1, 5)
+            A = make_increasing(rng, n, 60)
+            B = make_increasing(rng, m, 60)
+            lo = rng.randint(-20, 5)
+            hi = lo + rng.randint(0, 25)
+            tol = rng.randint(0, 9)
+            ka = rng.randint(0, 5)
+            kb = rng.randint(0, 5)
+
+            expected = brute_force_capped(A, B, lo, hi, tol, ka, kb)
+            self.assertIsNotNone(expected)
+            d_exp, pairs_exp, cnt_exp, cost_exp, max_exp = expected
+            res = solve(
+                A, B, lo, hi, tol, 1,
+                max_skipped_a=ka, max_skipped_b=kb,
+            )
+            self.assertEqual(
+                (res.offset, res.pair_count,
+                 res.residual_abs_sum, res.max_abs_residual),
+                (d_exp, cnt_exp, cost_exp, max_exp),
+                msg=f"A={A} B={B} lo={lo} hi={hi} tol={tol} "
+                    f"ka={ka} kb={kb} exp={pairs_exp}",
+            )
+            got = [(p.index_a - 1, p.index_b - 1) for p in res.pairs]
+            self.assertEqual(got, [tuple(p) for p in pairs_exp])
+
+    def test_cap_never_trimmed_from_unconstrained_optimum(self):
+        # Property check on random data: capped optimum equals an optimum
+        # over *cap-respecting chains only* (cross-checked by brute force
+        # above); additionally it can never contain more pairs than the
+        # unconstrained optimum, and when both are feasible on the same data
+        # the uncapped count is an upper bound.
+        rng = random.Random(818)
+        for _ in range(200):
+            n = rng.randint(1, 6)
+            m = rng.randint(1, 6)
+            A = make_increasing(rng, n, 60)
+            B = make_increasing(rng, m, 60)
+            lo, hi = -30, 30
+            tol = rng.randint(0, 10)
+            ka = rng.randint(0, 3)
+            kb = rng.randint(0, 3)
+            unc = solve(A, B, lo, hi, tol, 1)
+            cap = solve(
+                A, B, lo, hi, tol, 1,
+                max_skipped_a=ka, max_skipped_b=kb,
+            )
+            self.assertLessEqual(cap.pair_count, unc.pair_count)
+            for p1, p2 in zip(cap.pairs, cap.pairs[1:]):
+                self.assertLessEqual(p2.index_a - p1.index_a - 1, ka)
+                self.assertLessEqual(p2.index_b - p1.index_b - 1, kb)
 
 
 if __name__ == "__main__":

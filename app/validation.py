@@ -117,6 +117,44 @@ def validate_payload(data: Any) -> dict:
             f"最低配对数不能超过 {MIN_PAIRS_MAX}", "min_pairs"
         )
 
+    # Optional consecutive-miss cap, enabled explicitly.  When disabled the
+    # request is exactly the original API; when enabled both per-side caps
+    # must be non-negative integers (0 means consecutive pairs may not skip
+    # any pulse on that side).
+    enabled = data.get("gap_limit_enabled", False)
+    if not isinstance(enabled, bool):
+        if isinstance(enabled, str) and enabled.strip().lower() in (
+            "true",
+            "false",
+        ):
+            enabled = enabled.strip().lower() == "true"
+        else:
+            raise ValidationError(
+                "是否启用连续漏失上限必须是布尔值", "gap_limit_enabled"
+            )
+
+    max_skipped_a: int | None = None
+    max_skipped_b: int | None = None
+    if enabled:
+        max_skipped_a = _coerce_int(
+            data.get("max_skipped_a"), "max_skipped_a", "A 侧连续漏失上限"
+        )
+        max_skipped_b = _coerce_int(
+            data.get("max_skipped_b"), "max_skipped_b", "B 侧连续漏失上限"
+        )
+        if max_skipped_a < 0 or max_skipped_b < 0:
+            raise ValidationError(
+                "连续漏失上限不能为负",
+                "max_skipped_a" if max_skipped_a < 0 else "max_skipped_b",
+            )
+        if max_skipped_a > MAX_PULSES or max_skipped_b > MAX_PULSES:
+            raise ValidationError(
+                f"连续漏失上限不能超过 {MAX_PULSES}",
+                "max_skipped_a"
+                if max_skipped_a > MAX_PULSES
+                else "max_skipped_b",
+            )
+
     return {
         "A": probe_a,
         "B": probe_b,
@@ -124,4 +162,6 @@ def validate_payload(data: Any) -> dict:
         "offset_max": offset_max,
         "tolerance": tolerance,
         "min_pairs": min_pairs,
+        "max_skipped_a": max_skipped_a,
+        "max_skipped_b": max_skipped_b,
     }
